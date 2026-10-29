@@ -194,4 +194,173 @@ function toTitle(){S='title';sel=0;gp=null;for(let i=scene.children.length-1;i>=
 let last=performance.now();function loop(t){requestAnimationFrame(loop);const dt=Math.min(.05,(t-last)/1000);last=t;if(S=='race')update(dt);else if(eg&&S!='pause')eg.gain.value=0;else if(eg)eg.gain.value=0;
 if(S=='title'||S=='setup'||S=='help')return;renderer.render(scene,cam)}
 requestAnimationFrame(loop);draw();
-</script></body></html>
+</script>
+<!-- Turbo Circuit Online prototype -->
+<div id="online-panel" style="position:fixed;z-index:9999;top:10px;left:10px;background:#171923;color:white;padding:12px;border-radius:12px;font:14px sans-serif;max-width:280px">
+  <b>🏁 TURBO CIRCUIT ONLINE</b>
+  <p id="online-status">未接続</p>
+  <button id="create-room">ルーム作成</button>
+  <input id="room-code" placeholder="ルームコード"
+    maxlength="6" style="width:100px;text-transform:uppercase">
+  <button id="join-room">参加</button>
+  <p id="online-players">対戦相手：未確認</p>
+  <button id="start-online">レース開始</button>
+  <p id="online-countdown"></p>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script>
+(() => {
+  const SUPABASE_URL = "YOUR_SUPABASE_URL";
+  const SUPABASE_KEY = "YOUR_SUPABASE_PUBLISHABLE_KEY";
+
+  const statusEl = document.getElementById("online-status");
+  const playersEl = document.getElementById("online-players");
+  const codeInput = document.getElementById("room-code");
+  const countdownEl = document.getElementById("online-countdown");
+
+  if (SUPABASE_URL.includes("YOUR_") ||
+      SUPABASE_KEY.includes("YOUR_")) {
+    statusEl.textContent = "Supabaseの接続情報を設定してね";
+    return;
+  }
+
+  const supabase = window.supabase.createClient(
+    SUPABASE_URL, SUPABASE_KEY
+  );
+
+  const playerId = crypto.randomUUID();
+  let channel = null;
+  let roomCode = null;
+  let remotePlayer = null;
+  let lastSent = 0;
+
+  function setStatus(text) {
+    statusEl.textContent = text;
+  }
+
+  async function leaveRoom() {
+    if (channel) await supabase.removeChannel(channel);
+    channel = null;
+    remotePlayer = null;
+    playersEl.textContent = "対戦相手：未確認";
+  }
+
+  async function enterRoom(code) {
+    code = code.toUpperCase().replace(/[^A-Z0-9]/g, "");
+    if (code.length !== 6) {
+      setStatus("6文字のルームコードを入力してね");
+      return;
+    }
+
+    await leaveRoom();
+    roomCode = code;
+    codeInput.value = code;
+    setStatus("ルーム接続中...");
+
+    channel = supabase.channel("turbo-race-" + roomCode, {
+      config: { broadcast: { self: false } }
+    });
+
+    channel
+      .on("broadcast", { event: "hello" }, ({ payload }) => {
+        if (payload.id === playerId) return;
+        remotePlayer = payload;
+        playersEl.textContent = "対戦相手：接続中";
+      })
+      .on("broadcast", { event: "state" }, ({ payload }) => {
+        if (payload.id === playerId) return;
+        remotePlayer = payload;
+        playersEl.textContent = "対戦相手：通信中";
+        window.dispatchEvent(new CustomEvent(
+          "turbo-online-state", { detail: payload }
+        ));
+      })
+      .on("broadcast", { event: "race-start" }, ({ payload }) => {
+        countdownEl.textContent =
+          "レース開始！ サーバー時刻: " +
+          new Date(payload.startAt).toLocaleTimeString();
+        window.dispatchEvent(new CustomEvent(
+          "turbo-online-start", { detail: payload }
+        ));
+      })
+      .subscribe(async (state) => {
+        if (state === "SUBSCRIBED") {
+          setStatus("接続中：ルーム " + roomCode);
+          await channel.send({
+            type: "broadcast",
+            event: "hello",
+            payload: { id: playerId }
+          });
+        } else if (state === "CHANNEL_ERROR" ||
+                   state === "TIMED_OUT") {
+          setStatus("接続失敗。URL・キー・Realtime設定を確認");
+        } else if (state === "CLOSED") {
+          setStatus("接続が切れました");
+        }
+      });
+  }
+
+  document.getElementById("create-room").onclick = () => {
+    const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let code = "";
+    for (let i = 0; i < 6; i++) {
+      code += chars[Math.floor(Math.random() * chars.length)];
+    }
+    enterRoom(code);
+  };
+
+  document.getElementById("join-room").onclick = () => {
+    enterRoom(codeInput.value.trim());
+  };
+
+  document.getElementById("start-online").onclick = async () => {
+    if (!channel) {
+      setStatus("先にルームを作成・参加してね");
+      return;
+    }
+    const startAt = Date.now() + 5000;
+    await channel.send({
+      type: "broadcast",
+      event: "race-start",
+      payload: { startAt }
+    });
+    countdownEl.textContent = "5秒後にスタート予定";
+    window.dispatchEvent(new CustomEvent(
+      "turbo-online-start", { detail: { startAt } }
+    ));
+  };
+
+  // ゲーム本体から呼び出すための通信API
+  window.turboOnline = {
+    get roomCode() { return roomCode; },
+    get remotePlayer() { return remotePlayer; },
+
+    sendState(state) {
+      if (!channel || !roomCode) return;
+      const now = performance.now();
+      if (now - lastSent < 100) return;
+      lastSent = now;
+
+      channel.send({
+        type: "broadcast",
+        event: "state",
+        payload: {
+          id: playerId,
+          x: Number(state.x),
+          y: Number(state.y),
+          angle: Number(state.angle),
+          lap: Number(state.lap || 0),
+          finished: Boolean(state.finished),
+          sentAt: Date.now()
+        }
+      });
+    }
+  };
+
+  window.addEventListener("pagehide", () => {
+    if (channel) supabase.removeChannel(channel);
+  });
+})();
+</script>
+</body></html>
